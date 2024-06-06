@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Chat with GPT-4</title>
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.3.1/css/bootstrap.min.css">
+    <script src="https://code.jquery.com/jquery-3.3.1.min.js"></script>
+</head>
+<body>
+<div class="container">
+    <h2 class="mt-5">Chat with GPT-4</h2>
+    <div><a href="{{ url_for('logout') }}">Logout</a></div>
+    <div><a href="{{ url_for('history') }}">Chat History</a></div>
+    <div class="card">
+        <div class="card-body">
+            <div id="chat" style="height: 400px; overflow-y: scroll; border: 1px solid #ccc; padding: 10px;">
+            </div>
+        </div>
+        <div class="card-footer">
+            <input type="text" id="userInput" class="form-control" placeholder="Say something..." autofocus>
+            <button class="btn btn-primary mt-2" onclick="sendChat()">Send</button>
+            <div class="form-check mt-2">
+                <input class="form-check-input" type="checkbox" value="" id="cotMode">
+                <label class="form-check-label" for="cotMode">
+                    Enable Chain of Thought (CoT) mode
+                </label>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+function sendChat() {
+    let inputText = $('#userInput').val();
+    let cotMode = $('#cotMode').is(':checked');
+    if (inputText.trim() === '') return;
+    $.ajax({
+        url: '/chat',
+        type: 'POST',
+        contentType: 'application/json',
+        data: JSON.stringify({ 'input': inputText, 'cot_mode': cotMode }),
+        success: function(data) {
+            if (data.error) {
+                $('#chat').append('<div class="alert alert-danger">Error: ' + $('<div>').text(data.error).html() + '</div>');
+            } else {
+                $('#chat').append('<div><strong>You:</strong> ' + $('<div>').text(inputText).html() + '</div>');
+                $('#chat').append('<div><strong>GPT-4:</strong> ' + $('<div>').text(data.response).html() + '</div>');
+                $('#chat').append('<div><small>Training loss: ' + data.loss.toFixed(4) + '</small></div><hr>');
+            }
+            $('#userInput').val('');
+            $('#chat').scrollTop($('#chat')[0].scrollHeight);
+        },
+        error: function() {
+            $('#chat').append('<div class="alert alert-danger">An error occurred while communicating with the server.</div>');
+        }
+    });
+}
+
+$(document).keypress(function(e) {
+    if (e.which == 13 && !e.shiftKey) {
+        sendChat();
+        e.preventDefault();
+    }
+});
+</script>
+</body>
+</html>

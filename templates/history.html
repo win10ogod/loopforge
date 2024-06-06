@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Chat History</title>
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.3.1/css/bootstrap.min.css">
+    <script src="https://code.jquery.com/jquery-3.3.1.min.js"></script>
+</head>
+<body>
+<div class="container">
+    <h2 class="mt-5">Chat History</h2>
+    <div><a href="{{ url_for('index') }}">Back to Chat</a></div>
+    <div class="mt-3">
+        <ul class="list-unstyled">
+            {% for chat in chats %}
+            <li class="media">
+                <div class="media-body">
+                    <h5 class="mt-0 mb-1">Chat ID: {{ chat.id }}</h5>
+                    <p><strong>You:</strong> {{ chat.input_text }}</p>
+                    <p><strong>GPT-4:</strong> {{ chat.response_text }}</p>
+                </div>
+            </li>
+            {% endfor %}
+        </ul>
+        <div>
+            {% if prev_url %}
+            <a href="{{ prev_url }}">Previous</a>
+            {% endif %}
+            {% if next_url %}
+            <a href="{{ next_url }}">Next</a>
+            {% endif %}
+        </div>
+    </div>
+</div>
+</body>
+</html>
