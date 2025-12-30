@@ -105,6 +105,8 @@ gunicorn -w 4 -b 0.0.0.0:8000 --timeout 120 app:app
 |----------|----------|---------|-------------|
 | `SECRET_KEY` | Yes | `your_secret_key_here` | Flask session encryption |
 | `TOGETHER_API_KEY` | Yes | None | API key for LLM service |
+| `OPENAI_API_BASE` | No | `http://127.0.0.1:5001/v1` | OpenAI-compatible API base URL |
+| `OPENAI_MODEL` | No | `gpt-4-turbo` | Model name to use for chat |
 | `DATABASE_URL` | No | `sqlite:///app.db` | Database connection string |
 | `FLASK_DEBUG` | No | `False` | Enable debug mode (dev only) |
 | `POSTS_PER_PAGE` | No | `10` | Pagination size for history |
@@ -133,15 +135,20 @@ def get_session_model() -> GPT2LMHeadModel:
 
 ### Error Handling Pattern
 ```python
-# Catch specific exceptions with appropriate responses
+# OpenAI v1.0+ error classes (imported directly from openai)
+from openai import RateLimitError, APIConnectionError, APIError, APIStatusError
+
 try:
     # Operation
-except openai.error.RateLimitError:
+except RateLimitError:
     logging.warning("API rate limit exceeded")
     raise RuntimeError("Service temporarily unavailable.")
-except openai.error.APIConnectionError as e:
+except APIConnectionError as e:
     logging.error(f"API connection failed: {str(e)}")
     raise RuntimeError("Cannot connect to AI service.")
+except APIStatusError as e:
+    logging.error(f"API status error: {e.status_code}")
+    raise RuntimeError("Error communicating with AI service")
 except ValueError as e:
     return jsonify({'error': str(e)}), 400
 except RuntimeError as e:
@@ -192,11 +199,21 @@ current_user.chats.order_by(Chat.id.desc()).paginate(page, per_page, False)
 
 ## API Integration
 
-The app uses OpenAI-compatible API:
+The app uses OpenAI v1.0+ client with configurable endpoint:
 ```python
-openai.api_base = 'http://127.0.0.1:5001/v1'  # Default local endpoint
-# Model: gpt-4.0-turbo
-# Temperature: 0.7, top_p: 0.9, max_tokens: 400
+from openai import OpenAI
+
+openai_client = OpenAI(
+    api_key=os.getenv("TOGETHER_API_KEY"),
+    base_url=os.getenv("OPENAI_API_BASE", "http://127.0.0.1:5001/v1")
+)
+
+# API call example
+response = openai_client.chat.completions.create(
+    model=os.getenv("OPENAI_MODEL", "gpt-4-turbo"),
+    temperature=0.7, top_p=0.9, max_tokens=400,
+    messages=[...]
+)
 ```
 
 ## Frontend Notes

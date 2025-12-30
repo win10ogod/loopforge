@@ -9,7 +9,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import torch
 import torch.optim
 from transformers import GPT2LMHeadModel, GPT2Tokenizer, GPT2Config
-import openai
+from openai import OpenAI, RateLimitError, APIConnectionError, APIError, APIStatusError
 import os
 from dotenv import load_dotenv
 import logging
@@ -17,9 +17,12 @@ from typing import Optional, Tuple
 
 # Load environment variables
 load_dotenv()
-# 設置 OpenAI API Key 和本地 API 地址
-openai.api_key = os.getenv("TOGETHER_API_KEY", "your_openai_api_key")
-openai.api_base = 'http://127.0.0.1:5001/v1'
+
+# Initialize OpenAI client (v1.0+ API)
+openai_client = OpenAI(
+    api_key=os.getenv("TOGETHER_API_KEY", "your_openai_api_key"),
+    base_url=os.getenv("OPENAI_API_BASE", "http://127.0.0.1:5001/v1")
+)
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'your_secret_key_here')
@@ -128,8 +131,8 @@ def chat_and_train(input_text: str, cot_mode: bool = False) -> Tuple[str, float]
     messages.append({"role": "user", "content": input_text})
 
     try:
-        response = openai.ChatCompletion.create(
-            model="gpt-4.0-turbo",
+        response = openai_client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4-turbo"),
             temperature=0.7,
             top_p=0.9,
             max_tokens=400,
@@ -137,17 +140,20 @@ def chat_and_train(input_text: str, cot_mode: bool = False) -> Tuple[str, float]
             frequency_penalty=0.3,
             messages=messages
         )
-        model_response = response['choices'][0]['message']['content']
-    except openai.error.RateLimitError:
+        model_response = response.choices[0].message.content
+    except RateLimitError:
         logging.warning("API rate limit exceeded")
         raise RuntimeError("Service temporarily unavailable. Please try again later.")
-    except openai.error.APIConnectionError as e:
+    except APIConnectionError as e:
         logging.error(f"API connection failed: {str(e)}")
         raise RuntimeError("Cannot connect to AI service. Check your network.")
-    except openai.error.APIError as e:
+    except APIStatusError as e:
+        logging.error(f"API status error: {e.status_code} - {str(e)}")
+        raise RuntimeError("Error communicating with AI service")
+    except APIError as e:
         logging.error(f"OpenAI API error: {str(e)}")
         raise RuntimeError("Error communicating with AI service")
-    except (KeyError, IndexError) as e:
+    except (AttributeError, IndexError) as e:
         logging.error(f"Unexpected API response format: {str(e)}")
         raise RuntimeError("Invalid response from AI service")
 
@@ -250,9 +256,10 @@ def chat():
 @app.route('/history')
 @login_required
 def history():
-    page = request.args.get('page', 1, type=int)  # 使用 request.args 而不是 args
+    page = request.args.get('page', 1, type=int)
+    # Flask-SQLAlchemy 3.0+ requires keyword arguments for paginate
     chats = current_user.chats.order_by(Chat.id.desc()).paginate(
-        page, app.config['POSTS_PER_PAGE'], False)
+        page=page, per_page=app.config['POSTS_PER_PAGE'], error_out=False)
     next_url = url_for('history', page=chats.next_num) \
         if chats.has_next else None
     prev_url = url_for('history', page=chats.prev_num) \
