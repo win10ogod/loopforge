@@ -12,14 +12,14 @@
 
 | Category | Technology |
 |----------|-----------|
-| Backend | Flask 2.1.2 |
-| Database | SQLAlchemy 1.4.27 + SQLite |
-| Authentication | Flask-Login 0.5.0 |
-| Forms | Flask-WTF 1.0.0, WTForms 3.0.0 |
-| ML/NLP | PyTorch 1.10.0, Transformers 4.12.3 |
-| API Client | OpenAI 0.10.2 |
+| Backend | Flask >=2.3.0 |
+| Database | SQLAlchemy >=2.0.0 + SQLite |
+| Authentication | Flask-Login >=0.6.0 |
+| Forms | Flask-WTF >=1.2.0, WTForms >=3.1.0 |
+| ML/NLP | PyTorch >=2.0.0, Transformers >=4.30.0 |
+| API Client | OpenAI >=1.0.0 |
 | Frontend | Bootstrap 4.3.1, jQuery 3.3.1 (CDN) |
-| Production | Gunicorn 20.1.0 |
+| Production | Gunicorn >=21.0.0 |
 
 ## File Structure
 
@@ -42,24 +42,34 @@ loopforge/
 
 ## Key Components in app.py
 
-### Database Models (lines 36-47)
+### Database Models (lines 39-60)
 - **User**: id, username, email, password_hash, chats relationship
+  - `set_password(password)`: Hash and store password securely using PBKDF2-SHA256
+  - `check_password(password)`: Verify password against stored hash
 - **Chat**: id, input_text, response_text, user_id (FK)
 
-### Forms (lines 55-77)
+### Forms (lines 68-91)
 - **LoginForm**: username, password, remember_me
 - **RegistrationForm**: username, email, password with uniqueness validation
 
-### ML Components (lines 80-91)
+### ML Components (lines 93-106)
 - GPT-2 model configuration: 768 embeddings, 10 layers, 12 heads
-- AdamW optimizer with lr=5e-5
+- `torch.optim.AdamW` optimizer with lr=5e-5
 - Session-based model state management via `get_session_model()`
 
-### Core Function (lines 93-129)
-`chat_and_train(input_text, cot_mode=False)`:
+### Core Function (lines 109-167)
+`chat_and_train(input_text: str, cot_mode: bool = False) -> Tuple[str, float]`:
 - Calls GPT-4 API with optional Chain-of-Thought mode
+- Handles specific API exceptions (RateLimitError, APIConnectionError, APIError)
 - Tokenizes conversation, performs forward/backward pass
 - Updates model in session storage
+- Returns tuple of (response_text, loss_value)
+
+### Input Validation (lines 183-202)
+`_validate_chat_input(data: Optional[dict]) -> Tuple[str, bool]`:
+- Validates JSON request body
+- Enforces 2000 character limit on input
+- Type-checks cot_mode boolean
 
 ### Routes
 | Route | Method | Auth | Purpose |
@@ -80,12 +90,13 @@ pip install -r requirements.txt
 # Set environment variables
 export SECRET_KEY="your-secret-key"
 export TOGETHER_API_KEY="your-api-key"
+export FLASK_DEBUG="true"  # Only for development
 
 # Run development server
 python app.py
 
 # Production deployment
-gunicorn -w 4 -b 0.0.0.0:8000 app:app
+gunicorn -w 4 -b 0.0.0.0:8000 --timeout 120 app:app
 ```
 
 ## Environment Variables
@@ -95,6 +106,8 @@ gunicorn -w 4 -b 0.0.0.0:8000 app:app
 | `SECRET_KEY` | Yes | `your_secret_key_here` | Flask session encryption |
 | `TOGETHER_API_KEY` | Yes | None | API key for LLM service |
 | `DATABASE_URL` | No | `sqlite:///app.db` | Database connection string |
+| `FLASK_DEBUG` | No | `False` | Enable debug mode (dev only) |
+| `POSTS_PER_PAGE` | No | `10` | Pagination size for history |
 
 ## Code Conventions
 
@@ -103,19 +116,36 @@ gunicorn -w 4 -b 0.0.0.0:8000 app:app
 - **Classes**: PascalCase
 - **Routes**: lowercase with hyphens
 
+### Type Hints
+All functions include type hints for parameters and return values:
+```python
+def chat_and_train(input_text: str, cot_mode: bool = False) -> Tuple[str, float]:
+def load_user(user_id: int) -> Optional[User]:
+def get_session_model() -> GPT2LMHeadModel:
+```
+
 ### Patterns Used
 - MVC architecture (Models + Templates + Routes in app.py)
 - Decorator-based auth: `@login_required`
 - Session-based ML model state
 - WTForms for validation with custom validators
+- Secure password hashing with Werkzeug
 
 ### Error Handling Pattern
 ```python
+# Catch specific exceptions with appropriate responses
 try:
     # Operation
-except Exception as e:
-    logging.error(f"Context: {str(e)}")
-    raise RuntimeError("User-friendly message")
+except openai.error.RateLimitError:
+    logging.warning("API rate limit exceeded")
+    raise RuntimeError("Service temporarily unavailable.")
+except openai.error.APIConnectionError as e:
+    logging.error(f"API connection failed: {str(e)}")
+    raise RuntimeError("Cannot connect to AI service.")
+except ValueError as e:
+    return jsonify({'error': str(e)}), 400
+except RuntimeError as e:
+    return jsonify({'error': str(e)}), 500
 ```
 
 ### Database Queries
@@ -125,13 +155,21 @@ User.query.filter_by(username=name).first()
 current_user.chats.order_by(Chat.id.desc()).paginate(page, per_page, False)
 ```
 
-## Known Issues / Technical Debt
+## Security Features
 
-1. **Password Storage**: Passwords stored as plaintext in `password_hash` field (line 144). Should use bcrypt/werkzeug.security.
-2. **Broad Exception Handling**: Uses generic `except Exception` - should catch specific exceptions.
-3. **Missing Configuration**: `POSTS_PER_PAGE` referenced but not defined in config.
-4. **No Test Suite**: No automated tests exist.
-5. **No Database Migrations**: Uses `db.create_all()` - no Alembic/Flask-Migrate.
+1. **Password Hashing**: Uses PBKDF2-SHA256 via `werkzeug.security`
+2. **CSRF Protection**: Flask-WTF on all forms
+3. **Input Validation**: Length limits and type checking on `/chat` endpoint
+4. **Environment-based Debug Mode**: Debug disabled by default
+5. **Session-based Authentication**: Flask-Login
+6. **SQL Injection Protection**: SQLAlchemy ORM
+
+## Remaining Technical Debt
+
+1. **No Test Suite**: No automated tests exist
+2. **No Database Migrations**: Uses `db.create_all()` - consider adding Alembic/Flask-Migrate
+3. **Session Model Storage**: Large model states in session may cause performance issues
+4. **No Rate Limiting**: Consider adding Flask-Limiter for API protection
 
 ## When Modifying Code
 
@@ -139,11 +177,12 @@ current_user.chats.order_by(Chat.id.desc()).paginate(page, per_page, False)
 1. Add route handler in `app.py` with appropriate decorators
 2. Create template in `templates/` if needed
 3. Use `@login_required` for authenticated endpoints
-4. Add database operations within request context
+4. Add input validation for POST endpoints
+5. Include type hints and docstrings
 
 ### Modifying ML Components
-- Model config at lines 83-85
-- Training logic in `chat_and_train()` (lines 93-129)
+- Model config at lines 96-98
+- Training logic in `chat_and_train()` (lines 109-167)
 - Session model accessed via `get_session_model()`
 
 ### Adding Form Fields
@@ -166,13 +205,6 @@ openai.api_base = 'http://127.0.0.1:5001/v1'  # Default local endpoint
 - AJAX calls via jQuery for `/chat` endpoint
 - Bootstrap 4.3.1 for styling
 - Chain-of-Thought mode toggle available in index.html
-
-## Security Considerations
-
-- CSRF protection via Flask-WTF on all forms
-- Session-based authentication with Flask-Login
-- Environment variables for secrets (use `.env` file)
-- SQLAlchemy ORM provides SQL injection protection
 
 ## License
 

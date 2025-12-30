@@ -5,12 +5,15 @@ from flask_login import LoginManager, UserMixin, login_user, login_required, log
 from flask_wtf import FlaskForm
 from wtforms import StringField, PasswordField, BooleanField, SubmitField
 from wtforms.validators import DataRequired, ValidationError, Email, EqualTo
+from werkzeug.security import generate_password_hash, check_password_hash
 import torch
-from transformers import GPT2LMHeadModel, GPT2Tokenizer, GPT2Config, AdamW
+import torch.optim
+from transformers import GPT2LMHeadModel, GPT2Tokenizer, GPT2Config
 import openai
 import os
 from dotenv import load_dotenv
 import logging
+from typing import Optional, Tuple
 
 # Load environment variables
 load_dotenv()
@@ -23,6 +26,8 @@ app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'your_secret_key_here')
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///app.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SESSION_TYPE'] = 'filesystem'
+app.config['POSTS_PER_PAGE'] = int(os.getenv('POSTS_PER_PAGE', '10'))
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max request size
 
 db = SQLAlchemy(app)
 Session(app)
@@ -37,8 +42,16 @@ class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(64), index=True, unique=True)
     email = db.Column(db.String(120), index=True, unique=True)
-    password_hash = db.Column(db.String(128))
+    password_hash = db.Column(db.String(256))  # Increased for bcrypt hash
     chats = db.relationship('Chat', backref='author', lazy='dynamic')
+
+    def set_password(self, password: str) -> None:
+        """Hash and store password securely."""
+        self.password_hash = generate_password_hash(password, method='pbkdf2:sha256')
+
+    def check_password(self, password: str) -> bool:
+        """Verify password against stored hash."""
+        return check_password_hash(self.password_hash, password)
 
 class Chat(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -48,8 +61,9 @@ class Chat(db.Model):
 
 # User loader
 @login_manager.user_loader
-def load_user(id):
-    return User.query.get(int(id))
+def load_user(user_id: int) -> Optional[User]:
+    """Load user by ID for Flask-Login."""
+    return User.query.get(int(user_id))
 
 # Forms
 class LoginForm(FlaskForm):
@@ -82,16 +96,31 @@ tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 tokenizer.pad_token = tokenizer.eos_token
 configuration = GPT2Config(n_embd=768, n_layer=10, n_head=12)
 model = GPT2LMHeadModel(configuration).to(device)
-optimizer = AdamW(model.parameters(), lr=5e-5)
+optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
 
-def get_session_model():
+def get_session_model() -> GPT2LMHeadModel:
+    """Load model state from session or initialize with default."""
     if 'model_state' not in session:
         session['model_state'] = model.state_dict()
     model.load_state_dict(session['model_state'])
     return model
 
-def chat_and_train(input_text, cot_mode=False):
-    model = get_session_model()
+
+def chat_and_train(input_text: str, cot_mode: bool = False) -> Tuple[str, float]:
+    """
+    Chat with GPT-4 API and train local GPT-2 model on the conversation.
+
+    Args:
+        input_text: User's input message
+        cot_mode: Enable Chain-of-Thought prompting
+
+    Returns:
+        Tuple of (model response text, training loss value)
+
+    Raises:
+        RuntimeError: If API communication or model training fails
+    """
+    current_model = get_session_model()
     system_prompt = "You are a helpful assistant."
     messages = [{"role": "system", "content": system_prompt}]
     if cot_mode:
@@ -109,20 +138,29 @@ def chat_and_train(input_text, cot_mode=False):
             messages=messages
         )
         model_response = response['choices'][0]['message']['content']
-    except Exception as e:
-        logging.error(f"Error communicating with OpenAI: {str(e)}")
-        raise RuntimeError("Error communicating with OpenAI GPT-4 service")
+    except openai.error.RateLimitError:
+        logging.warning("API rate limit exceeded")
+        raise RuntimeError("Service temporarily unavailable. Please try again later.")
+    except openai.error.APIConnectionError as e:
+        logging.error(f"API connection failed: {str(e)}")
+        raise RuntimeError("Cannot connect to AI service. Check your network.")
+    except openai.error.APIError as e:
+        logging.error(f"OpenAI API error: {str(e)}")
+        raise RuntimeError("Error communicating with AI service")
+    except (KeyError, IndexError) as e:
+        logging.error(f"Unexpected API response format: {str(e)}")
+        raise RuntimeError("Invalid response from AI service")
 
     try:
         encodings = tokenizer(input_text + tokenizer.eos_token + model_response, return_tensors='pt')
         input_ids = encodings.input_ids.to(device)
         attn_mask = encodings.attention_mask.to(device)
         optimizer.zero_grad()
-        outputs = model(input_ids, labels=input_ids, attention_mask=attn_mask)
+        outputs = current_model(input_ids, labels=input_ids, attention_mask=attn_mask)
         loss = outputs.loss
         loss.backward()
         optimizer.step()
-        session['model_state'] = model.state_dict()
+        session['model_state'] = current_model.state_dict()
         return model_response, loss.item()
     except Exception as e:
         logging.error(f"Training failed: {str(e)}")
@@ -141,7 +179,7 @@ def login():
     form = LoginForm()
     if form.validate_on_submit():
         user = User.query.filter_by(username=form.username.data).first()
-        if user is None or not user.password_hash == form.password.data:
+        if user is None or not user.check_password(form.password.data):
             flash('Invalid username or password')
             return redirect(url_for('login'))
         login_user(user, remember=form.remember_me.data)
@@ -159,28 +197,55 @@ def register():
         return redirect(url_for('index'))
     form = RegistrationForm()
     if form.validate_on_submit():
-        user = User(username=form.username.data, email=form.email.data, password_hash=form.password.data)
+        user = User(username=form.username.data, email=form.email.data)
+        user.set_password(form.password.data)
         db.session.add(user)
         db.session.commit()
         flash('Congratulations, you are now a registered user!')
         return redirect(url_for('login'))
     return render_template('register.html', title='Register', form=form)
 
+def _validate_chat_input(data: Optional[dict]) -> Tuple[str, bool]:
+    """Validate and extract chat input from request data."""
+    if not data:
+        raise ValueError("Request body must be JSON")
+
+    user_input = data.get('input', '')
+    if not isinstance(user_input, str):
+        raise ValueError("Input must be a string")
+
+    user_input = user_input.strip()
+    if not user_input:
+        raise ValueError("Input cannot be empty")
+    if len(user_input) > 2000:
+        raise ValueError("Input exceeds maximum length of 2000 characters")
+
+    cot_mode = data.get('cot_mode', False)
+    if not isinstance(cot_mode, bool):
+        raise ValueError("cot_mode must be a boolean")
+
+    return user_input, cot_mode
+
+
 @app.route('/chat', methods=['POST'])
 @login_required
 def chat():
-    data = request.json
-    user_input = data['input']
-    cot_mode = data.get('cot_mode', False)
     try:
+        user_input, cot_mode = _validate_chat_input(request.json)
         response_text, loss = chat_and_train(user_input, cot_mode)
-        chat = Chat(input_text=user_input, response_text=response_text, author=current_user)
-        db.session.add(chat)
+        chat_record = Chat(input_text=user_input, response_text=response_text, author=current_user)
+        db.session.add(chat_record)
         db.session.commit()
         return jsonify({'response': response_text, 'loss': loss})
-    except Exception as e:
-        logging.error(f"Failed to process user input: {str(e)}")
+    except ValueError as e:
+        logging.warning(f"Invalid input from user {current_user.id}: {str(e)}")
+        return jsonify({'error': str(e)}), 400
+    except RuntimeError as e:
+        logging.error(f"Processing error: {str(e)}")
         return jsonify({'error': str(e)}), 500
+    except Exception as e:
+        logging.error(f"Unexpected error in chat: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/history')
 @login_required
@@ -198,5 +263,10 @@ def history():
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-    
-    app.run(debug=True)
+
+    # Control debug mode via environment variable for security
+    debug_mode = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
+    if debug_mode:
+        logging.warning("Running in DEBUG mode - do not use in production!")
+
+    app.run(debug=debug_mode, host='127.0.0.1', port=5000)
